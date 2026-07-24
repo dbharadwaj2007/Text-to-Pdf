@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#c0605a">
   <meta name="color-scheme" content="light">
 
-  <title>Notepad → PDF Pro</title>
+  <title>Notepad → PDF Pro v4</title>
   <meta name="description" content="Write notes in your browser and save or share a polished PDF on iPhone, Android, tablet, or desktop.">
 
   <link rel="manifest" href="./manifest.webmanifest">
@@ -365,6 +365,7 @@
       *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
     }
   </style>
+  <meta name="app-version" content="4.0-single-file">
 </head>
 <body>
   <main class="app">
@@ -437,13 +438,1052 @@
 
   <noscript>This app needs JavaScript to create PDF files.</noscript>
 
-  <script
-    src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/4.2.1/jspdf.umd.min.js"
-    integrity="sha512-+EeCylkt9WHJk5tGJxYdecHOcXFRME7qnbsfeMsdQL6NUPYm2+uGFmyleEqsmVoap/f3dN/sc3BX9t9kHXkHHg=="
-    crossorigin="anonymous"
-    referrerpolicy="no-referrer"
-  ></script>
-  <script src="./pdfTemplates.js"></script>
-  <script src="./app.js"></script>
+  <script>
+    // Remove any service worker and caches left by versions 1-3.
+    // The previous worker could keep serving stale JavaScript after redeployment.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations()
+        .then((registrations) => Promise.all(registrations.map((registration) => registration.unregister())))
+        .catch(() => {});
+    }
+    if ('caches' in window) {
+      caches.keys()
+        .then((names) => Promise.all(names.map((name) => caches.delete(name))))
+        .catch(() => {});
+    }
+  </script>
+
+  <!-- Version 4: all PDF and app JavaScript is inline.
+       This avoids CDN failures, missing asset paths, and stale service-worker files. -->
+  <script>
+(function () {
+  'use strict';
+
+  const list = [
+    { id: 'plain', name: 'Plain', blurb: 'Clean text, no styling', pro: false },
+    { id: 'ruled', name: 'Ruled Notepad', blurb: 'Blue rules + red margin', pro: false },
+    { id: 'letterhead', name: 'Letterhead', blurb: 'Header, date, divider line', pro: true },
+    { id: 'journal', name: 'Journal', blurb: 'Dated entry + page numbers', pro: true },
+    { id: 'legal', name: 'Legal Brief', blurb: 'Numbered lines, double-spaced', pro: true },
+    { id: 'screenplay', name: 'Screenplay', blurb: 'Courier, industry margins', pro: true }
+  ];
+
+  const PAGE_SIZES = {
+    letter: { width: 612, height: 792 },
+    a4: { width: 595.28, height: 841.89 }
+  };
+
+  const COLORS = {
+    ink: [43, 42, 40],
+    muted: [107, 102, 92],
+    paper: [246, 241, 228],
+    rule: [169, 190, 220],
+    accent: [192, 96, 90]
+  };
+
+  const FONTS = {
+    courier: { resource: 'F1', base: 'Courier', factor: 0.60 },
+    courierBold: { resource: 'F2', base: 'Courier-Bold', factor: 0.60 },
+    helvetica: { resource: 'F3', base: 'Helvetica', factor: 0.52 },
+    helveticaBold: { resource: 'F4', base: 'Helvetica-Bold', factor: 0.54 },
+    times: { resource: 'F5', base: 'Times-Roman', factor: 0.50 },
+    timesBoldItalic: { resource: 'F6', base: 'Times-BoldItalic', factor: 0.52 }
+  };
+
+  function cleanText(value) {
+    return String(value || '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .replace(/\u0000/g, '');
+  }
+
+  function asciiText(value) {
+    return String(value || '')
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+      .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+      .replace(/[\u2013\u2014]/g, '-')
+      .replace(/\u2026/g, '...')
+      .replace(/\u2022/g, '*')
+      .replace(/\u2192/g, '->')
+      .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, '?');
+  }
+
+  function titleFromFilename(filename) {
+    const raw = asciiText(filename || 'My Document').replace(/[-_]+/g, ' ').trim();
+    return raw ? raw.replace(/\b\w/g, (char) => char.toUpperCase()) : 'My Document';
+  }
+
+  function humanDate() {
+    try {
+      return asciiText(new Intl.DateTimeFormat(undefined, {
+        year: 'numeric', month: 'long', day: 'numeric'
+      }).format(new Date()));
+    } catch (_) {
+      return asciiText(new Date().toLocaleDateString());
+    }
+  }
+
+  function number(value) {
+    return Number(value).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1');
+  }
+
+  function rgb(color) {
+    return color.map((item) => number(item / 255)).join(' ');
+  }
+
+  function escapePdfText(value) {
+    return asciiText(value)
+      .replace(/\\/g, '\\\\')
+      .replace(/\(/g, '\\(')
+      .replace(/\)/g, '\\)');
+  }
+
+  function wrapLine(text, maxChars) {
+    const source = asciiText(text).replace(/\t/g, '    ');
+    if (source === '') return [''];
+
+    const words = source.split(/\s+/);
+    const lines = [];
+    let current = '';
+
+    function pushLongWord(word) {
+      let remainder = word;
+      while (remainder.length > maxChars) {
+        lines.push(remainder.slice(0, maxChars));
+        remainder = remainder.slice(maxChars);
+      }
+      current = remainder;
+    }
+
+    for (const word of words) {
+      if (!current) {
+        if (word.length > maxChars) pushLongWord(word);
+        else current = word;
+        continue;
+      }
+
+      if ((current.length + 1 + word.length) <= maxChars) {
+        current += ` ${word}`;
+      } else {
+        lines.push(current);
+        if (word.length > maxChars) pushLongWord(word);
+        else current = word;
+      }
+    }
+
+    if (current || lines.length === 0) lines.push(current);
+    return lines;
+  }
+
+  function maxCharsFor(width, fontKey, fontSize) {
+    const font = FONTS[fontKey] || FONTS.courier;
+    return Math.max(1, Math.floor(width / (fontSize * font.factor)));
+  }
+
+  function makePage(width, height) {
+    return { width, height, commands: [] };
+  }
+
+  function command(page, value) {
+    page.commands.push(value);
+  }
+
+  function fillPage(page, color) {
+    command(page, `${rgb(color)} rg\n0 0 ${number(page.width)} ${number(page.height)} re f`);
+  }
+
+  function drawLine(page, x1, top1, x2, top2, color, lineWidth) {
+    const y1 = page.height - top1;
+    const y2 = page.height - top2;
+    command(page, `${rgb(color)} RG\n${number(lineWidth || 0.6)} w\n${number(x1)} ${number(y1)} m ${number(x2)} ${number(y2)} l S`);
+  }
+
+  function drawText(page, text, x, top, options) {
+    const settings = options || {};
+    const fontKey = settings.font || 'courier';
+    const font = FONTS[fontKey] || FONTS.courier;
+    const fontSize = Number(settings.size) || 12;
+    const color = settings.color || COLORS.ink;
+    const align = settings.align || 'left';
+    const safeText = asciiText(text);
+    let drawX = x;
+
+    if (align !== 'left') {
+      const estimatedWidth = safeText.length * fontSize * font.factor;
+      if (align === 'right') drawX -= estimatedWidth;
+      if (align === 'center') drawX -= estimatedWidth / 2;
+    }
+
+    const y = page.height - top;
+    command(page,
+      `BT\n/${font.resource} ${number(fontSize)} Tf\n${rgb(color)} rg\n1 0 0 1 ${number(drawX)} ${number(y)} Tm\n(${escapePdfText(safeText)}) Tj\nET`
+    );
+  }
+
+  function drawRuledBackground(page, leftMargin, top, bottom, lineHeight) {
+    for (let y = top; y <= bottom; y += lineHeight) {
+      drawLine(page, leftMargin, y, page.width - 42, y, COLORS.rule, 0.55);
+    }
+    drawLine(page, leftMargin - 14, 0, leftMargin - 14, page.height, COLORS.accent, 1);
+  }
+
+  function paginateParagraphs(text, settings, makeDecoratedPage, drawLineText) {
+    const paragraphs = cleanText(text).split('\n');
+    const pages = [];
+    let pageNumber = 0;
+    let page;
+    let y;
+
+    function newPage() {
+      pageNumber += 1;
+      page = makeDecoratedPage(pageNumber);
+      pages.push(page);
+      y = settings.top;
+    }
+
+    newPage();
+
+    for (let p = 0; p < paragraphs.length; p += 1) {
+      const paragraph = paragraphs[p];
+      const maxChars = maxCharsFor(settings.width, settings.font, settings.fontSize);
+      const lines = wrapLine(paragraph, maxChars);
+
+      for (const line of lines) {
+        if (y > settings.bottom) newPage();
+        drawLineText(page, line, y, pageNumber);
+        y += settings.lineHeight;
+      }
+
+      if (p < paragraphs.length - 1 && paragraph !== '') {
+        y += settings.paragraphGap || 0;
+      }
+    }
+
+    return pages;
+  }
+
+  function renderPlain(options, size) {
+    const left = 54;
+    const right = 54;
+    const top = 64;
+    const bottom = size.height - 54;
+    const lineHeight = options.fontSize * 1.55;
+
+    return paginateParagraphs(options.text, {
+      top,
+      bottom,
+      width: size.width - left - right,
+      font: 'courier',
+      fontSize: options.fontSize,
+      lineHeight,
+      paragraphGap: options.fontSize * 0.35
+    }, () => {
+      const page = makePage(size.width, size.height);
+      fillPage(page, COLORS.paper);
+      return page;
+    }, (page, line, y) => {
+      if (line !== '') drawText(page, line, left, y, { font: 'courier', size: options.fontSize });
+    });
+  }
+
+  function renderRuled(options, size) {
+    const left = 74;
+    const right = 48;
+    const top = 74;
+    const lineHeight = Math.max(24, options.fontSize * 1.7);
+    const bottom = size.height - 48;
+
+    return paginateParagraphs(options.text, {
+      top,
+      bottom,
+      width: size.width - left - right,
+      font: 'courier',
+      fontSize: options.fontSize,
+      lineHeight,
+      paragraphGap: 0
+    }, () => {
+      const page = makePage(size.width, size.height);
+      fillPage(page, COLORS.paper);
+      drawRuledBackground(page, left, top + 5, bottom + 5, lineHeight);
+      return page;
+    }, (page, line, y) => {
+      if (line !== '') drawText(page, line, left, y, { font: 'courier', size: options.fontSize });
+    });
+  }
+
+  function renderLetterhead(options, size) {
+    const left = 58;
+    const right = 58;
+    const top = 112;
+    const bottom = size.height - 58;
+    const lineHeight = options.fontSize * 1.5;
+    const title = titleFromFilename(options.filename);
+
+    return paginateParagraphs(options.text, {
+      top,
+      bottom,
+      width: size.width - left - right,
+      font: 'times',
+      fontSize: options.fontSize,
+      lineHeight,
+      paragraphGap: options.fontSize * 0.5
+    }, (pageNumber) => {
+      const page = makePage(size.width, size.height);
+      fillPage(page, COLORS.paper);
+      drawText(page, title, left, 48, { font: 'helveticaBold', size: 18, color: COLORS.accent });
+      drawText(page, humanDate(), left, 66, { font: 'helvetica', size: 9.5, color: COLORS.muted });
+      drawText(page, `Page ${pageNumber}`, size.width - right, 66, {
+        font: 'helvetica', size: 9.5, color: COLORS.muted, align: 'right'
+      });
+      drawLine(page, left, 78, size.width - right, 78, COLORS.accent, 1.25);
+      drawLine(page, left, size.height - 36, size.width - right, size.height - 36, [210, 203, 185], 0.5);
+      return page;
+    }, (page, line, y) => {
+      if (line !== '') drawText(page, line, left, y, { font: 'times', size: options.fontSize });
+    });
+  }
+
+  function renderJournal(options, size) {
+    const left = 70;
+    const right = 52;
+    const top = 118;
+    const lineHeight = Math.max(25, options.fontSize * 1.75);
+    const bottom = size.height - 62;
+
+    return paginateParagraphs(options.text, {
+      top,
+      bottom,
+      width: size.width - left - right,
+      font: 'times',
+      fontSize: options.fontSize,
+      lineHeight,
+      paragraphGap: 0
+    }, (pageNumber) => {
+      const page = makePage(size.width, size.height);
+      fillPage(page, COLORS.paper);
+      drawText(page, 'Journal', left, 48, { font: 'timesBoldItalic', size: 16, color: COLORS.accent });
+      drawText(page, humanDate(), left, 69, { font: 'times', size: 10, color: COLORS.muted });
+      drawText(page, String(pageNumber), size.width - right, size.height - 28, {
+        font: 'times', size: 10, color: COLORS.muted, align: 'right'
+      });
+      drawRuledBackground(page, left, top + 5, bottom + 5, lineHeight);
+      return page;
+    }, (page, line, y) => {
+      if (line !== '') drawText(page, line, left, y, { font: 'times', size: options.fontSize });
+    });
+  }
+
+  function renderLegal(options, size) {
+    const left = 88;
+    const right = 62;
+    const top = 72;
+    const lineHeight = Math.max(24, options.fontSize * 2);
+    const bottom = size.height - 58;
+    let legalLineNumber = 1;
+
+    return paginateParagraphs(options.text, {
+      top,
+      bottom,
+      width: size.width - left - right,
+      font: 'times',
+      fontSize: options.fontSize,
+      lineHeight,
+      paragraphGap: 0
+    }, (pageNumber) => {
+      const page = makePage(size.width, size.height);
+      fillPage(page, COLORS.paper);
+      drawLine(page, 70, 44, 70, bottom + 14, [180, 180, 180], 0.5);
+      drawText(page, `LEGAL BRIEF  -  PAGE ${pageNumber}`, size.width - right, 40, {
+        font: 'helvetica', size: 8, color: COLORS.muted, align: 'right'
+      });
+      return page;
+    }, (page, line, y) => {
+      drawText(page, String(legalLineNumber), 60, y, {
+        font: 'helvetica', size: 8, color: COLORS.muted, align: 'right'
+      });
+      if (line !== '') drawText(page, line, left, y, { font: 'times', size: options.fontSize });
+      legalLineNumber += 1;
+    });
+  }
+
+  function renderScreenplay(options, size) {
+    const left = 86;
+    const right = 60;
+    const top = 72;
+    const bottom = size.height - 54;
+    const fontSize = Math.max(10, Math.min(12, options.fontSize));
+    const lineHeight = fontSize * 1.55;
+    const pages = [];
+    let pageNumber = 0;
+    let page;
+    let y;
+
+    function newPage() {
+      pageNumber += 1;
+      page = makePage(size.width, size.height);
+      pages.push(page);
+      fillPage(page, COLORS.paper);
+      drawText(page, `${pageNumber}.`, size.width - right, 38, {
+        font: 'courier', size: 9, color: COLORS.muted, align: 'right'
+      });
+      y = top;
+    }
+
+    function ensureSpace(linesNeeded) {
+      if (y + linesNeeded * lineHeight > bottom) newPage();
+    }
+
+    newPage();
+
+    for (const rawLine of cleanText(options.text).split('\n')) {
+      const trimmed = asciiText(rawLine).trim();
+      if (!trimmed) {
+        ensureSpace(1);
+        y += lineHeight;
+        continue;
+      }
+
+      const isSceneHeading = /^(INT\.|EXT\.|INT\/EXT\.|I\/E\.)/i.test(trimmed);
+      const isTransition = /^(FADE (IN|OUT)|CUT TO:|DISSOLVE TO:|SMASH CUT TO:)/i.test(trimmed)
+        || (/:$/.test(trimmed) && trimmed === trimmed.toUpperCase());
+      const isCharacter = trimmed.length <= 32 && trimmed === trimmed.toUpperCase() && !isSceneHeading && !isTransition;
+      const isParenthetical = /^\(.+\)$/.test(trimmed);
+      const isDialogue = rawLine.startsWith('    ') || rawLine.startsWith('\t');
+
+      let x = left;
+      let width = size.width - left - right;
+      let font = 'courier';
+      let align = 'left';
+
+      if (isSceneHeading) {
+        font = 'courierBold';
+      } else if (isTransition) {
+        x = size.width - right;
+        width = size.width * 0.36;
+        align = 'right';
+      } else if (isCharacter) {
+        x = size.width * 0.46;
+        width = size.width * 0.26;
+      } else if (isParenthetical) {
+        x = size.width * 0.39;
+        width = size.width * 0.33;
+      } else if (isDialogue) {
+        x = size.width * 0.32;
+        width = size.width * 0.46;
+      }
+
+      const lines = wrapLine(trimmed, maxCharsFor(width, font, fontSize));
+      ensureSpace(lines.length);
+      for (const line of lines) {
+        drawText(page, line, x, y, { font, size: fontSize, align });
+        y += lineHeight;
+      }
+    }
+
+    return pages;
+  }
+
+  function bytesFromAscii(value) {
+    const bytes = new Uint8Array(value.length);
+    for (let i = 0; i < value.length; i += 1) bytes[i] = value.charCodeAt(i) & 0xff;
+    return bytes;
+  }
+
+  function concatBytes(chunks) {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const output = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      output.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return output;
+  }
+
+  function buildPdf(pages, metadata) {
+    const pageCount = pages.length;
+    const firstFontObject = 3 + pageCount * 2;
+    const infoObject = firstFontObject + Object.keys(FONTS).length;
+    const totalObjects = infoObject;
+    const objects = new Array(totalObjects + 1);
+
+    objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+
+    const kids = [];
+    for (let index = 0; index < pageCount; index += 1) kids.push(`${3 + index * 2} 0 R`);
+    objects[2] = `<< /Type /Pages /Kids [${kids.join(' ')}] /Count ${pageCount} >>`;
+
+    const fontEntries = [];
+    Object.values(FONTS).forEach((font, index) => {
+      const objectId = firstFontObject + index;
+      fontEntries.push(`/${font.resource} ${objectId} 0 R`);
+      objects[objectId] = `<< /Type /Font /Subtype /Type1 /BaseFont /${font.base} /Encoding /WinAnsiEncoding >>`;
+    });
+
+    pages.forEach((page, index) => {
+      const pageObject = 3 + index * 2;
+      const contentObject = pageObject + 1;
+      const content = `${page.commands.join('\n')}\n`;
+      const contentBytes = bytesFromAscii(content);
+
+      objects[pageObject] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${number(page.width)} ${number(page.height)}] /Resources << /Font << ${fontEntries.join(' ')} >> >> /Contents ${contentObject} 0 R >>`;
+      objects[contentObject] = {
+        prefix: `<< /Length ${contentBytes.length} >>\nstream\n`,
+        bytes: contentBytes,
+        suffix: '\nendstream'
+      };
+    });
+
+    objects[infoObject] = `<< /Title (${escapePdfText(metadata.title)}) /Author (${escapePdfText(metadata.author || '')}) /Creator (Notepad to PDF) /Producer (Notepad to PDF built-in PDF engine) >>`;
+
+    const chunks = [bytesFromAscii('%PDF-1.4\n%\x80\x81\x82\x83\n')];
+    const offsets = new Array(totalObjects + 1).fill(0);
+    let currentOffset = chunks[0].length;
+
+    for (let objectId = 1; objectId <= totalObjects; objectId += 1) {
+      offsets[objectId] = currentOffset;
+      const start = bytesFromAscii(`${objectId} 0 obj\n`);
+      chunks.push(start);
+      currentOffset += start.length;
+
+      const object = objects[objectId];
+      if (typeof object === 'string') {
+        const body = bytesFromAscii(object);
+        chunks.push(body);
+        currentOffset += body.length;
+      } else {
+        const prefix = bytesFromAscii(object.prefix);
+        const suffix = bytesFromAscii(object.suffix);
+        chunks.push(prefix, object.bytes, suffix);
+        currentOffset += prefix.length + object.bytes.length + suffix.length;
+      }
+
+      const end = bytesFromAscii('\nendobj\n');
+      chunks.push(end);
+      currentOffset += end.length;
+    }
+
+    const xrefOffset = currentOffset;
+    let xref = `xref\n0 ${totalObjects + 1}\n`;
+    xref += '0000000000 65535 f \n';
+    for (let objectId = 1; objectId <= totalObjects; objectId += 1) {
+      xref += `${String(offsets[objectId]).padStart(10, '0')} 00000 n \n`;
+    }
+    xref += `trailer\n<< /Size ${totalObjects + 1} /Root 1 0 R /Info ${infoObject} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+    chunks.push(bytesFromAscii(xref));
+
+    return concatBytes(chunks);
+  }
+
+  function render(options) {
+    const normalized = {
+      text: cleanText(options && options.text),
+      templateId: (options && options.templateId) || 'plain',
+      filename: (options && options.filename) || 'my-document',
+      pageFormat: options && options.pageFormat === 'a4' ? 'a4' : 'letter',
+      fontSize: Math.max(8, Math.min(24, Number(options && options.fontSize) || 12)),
+      author: (options && options.author) || ''
+    };
+
+    const size = PAGE_SIZES[normalized.pageFormat];
+    let pages;
+
+    switch (normalized.templateId) {
+      case 'ruled':
+        pages = renderRuled(normalized, size);
+        break;
+      case 'letterhead':
+        pages = renderLetterhead(normalized, size);
+        break;
+      case 'journal':
+        pages = renderJournal(normalized, size);
+        break;
+      case 'legal':
+        pages = renderLegal(normalized, size);
+        break;
+      case 'screenplay':
+        pages = renderScreenplay(normalized, size);
+        break;
+      case 'plain':
+      default:
+        pages = renderPlain(normalized, size);
+        break;
+    }
+
+    const pdfBytes = buildPdf(pages, {
+      title: titleFromFilename(normalized.filename),
+      author: normalized.author
+    });
+
+    return Object.freeze({
+      output(type) {
+        if (type === 'blob') return new Blob([pdfBytes], { type: 'application/pdf' });
+        if (type === 'arraybuffer') {
+          return pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength);
+        }
+        if (type === 'uint8array') return new Uint8Array(pdfBytes);
+        return asciiText(String.fromCharCode.apply(null, Array.from(pdfBytes)));
+      }
+    });
+  }
+
+  window.PDFTemplates = Object.freeze({ list: Object.freeze(list), render });
+})();
+
+  </script>
+  <script>
+(function () {
+  'use strict';
+
+  const STORAGE = {
+    text: 'notepad_pdf_text_v2',
+    filename: 'notepad_pdf_filename_v2',
+    pageSize: 'notepad_pdf_pagesize_v2',
+    fontSize: 'notepad_pdf_fontsize_v2',
+    template: 'notepad_pdf_template_v2',
+    pro: 'pro_unlocked'
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const templatesEl = $('templates');
+  const textEl = $('text');
+  const filenameEl = $('filename');
+  const pageSizeEl = $('pagesize');
+  const fontSizeEl = $('fontsize');
+  const convertBtn = $('convert');
+  const statusEl = $('status');
+  const installBtn = $('installBtn');
+  const iosHint = $('iosHint');
+  const modalBackdrop = $('modalBackdrop');
+  const modalMessage = $('modalMessage');
+  const goCheckoutBtn = $('goCheckout');
+  const closeModalBtn = $('closeModal');
+  const proBadge = $('proBadge');
+
+  const isAppleMobile = /iPhone|iPad|iPod/i.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+    || window.navigator.standalone === true;
+
+  let selectedTemplate = readStorage(STORAGE.template) || 'plain';
+  let proUnlocked = readStorage(STORAGE.pro) === 'true';
+  let paymentsEnabled = false;
+  let deferredInstallPrompt = null;
+  let saveTimer = null;
+
+  function readStorage(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeStorage(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch (_) {
+      // Private browsing or restricted storage: the app still works without autosave.
+    }
+  }
+
+  function setStatus(message, type) {
+    statusEl.textContent = message || '';
+    statusEl.className = 'status' + (type ? ` ${type}` : '');
+  }
+
+  function sanitizeFilename(value) {
+    const cleaned = String(value || '')
+      .replace(/\.pdf$/i, '')
+      .replace(/[\\/:*?"<>|]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80);
+    return cleaned || 'my-document';
+  }
+
+  function restoreDraft() {
+    const savedText = readStorage(STORAGE.text);
+    const savedFilename = readStorage(STORAGE.filename);
+    const savedPageSize = readStorage(STORAGE.pageSize);
+    const savedFontSize = readStorage(STORAGE.fontSize);
+
+    if (savedText !== null) textEl.value = savedText;
+    if (savedFilename) filenameEl.value = savedFilename;
+    if (savedPageSize && [...pageSizeEl.options].some((o) => o.value === savedPageSize)) {
+      pageSizeEl.value = savedPageSize;
+    }
+    if (savedFontSize && [...fontSizeEl.options].some((o) => o.value === savedFontSize)) {
+      fontSizeEl.value = savedFontSize;
+    }
+
+    const templateExists = window.PDFTemplates.list.some((t) => t.id === selectedTemplate);
+    const selectedMeta = window.PDFTemplates.list.find((t) => t.id === selectedTemplate);
+    if (!templateExists || (selectedMeta && selectedMeta.pro && !proUnlocked)) {
+      selectedTemplate = 'plain';
+    }
+  }
+
+  function queueDraftSave() {
+    window.clearTimeout(saveTimer);
+    saveTimer = window.setTimeout(() => {
+      writeStorage(STORAGE.text, textEl.value);
+      writeStorage(STORAGE.filename, filenameEl.value);
+      writeStorage(STORAGE.pageSize, pageSizeEl.value);
+      writeStorage(STORAGE.fontSize, fontSizeEl.value);
+      writeStorage(STORAGE.template, selectedTemplate);
+    }, 250);
+  }
+
+  function renderTemplates() {
+    templatesEl.replaceChildren();
+
+    window.PDFTemplates.list.forEach((template) => {
+      const locked = template.pro && !proUnlocked;
+      const card = document.createElement('button');
+      card.type = 'button';
+      card.className = 'tpl'
+        + (template.id === selectedTemplate ? ' selected' : '')
+        + (locked ? ' locked' : '');
+      card.setAttribute('aria-pressed', String(template.id === selectedTemplate));
+      card.setAttribute('aria-label', `${template.name}. ${template.blurb}${locked ? '. Locked' : ''}`);
+
+      const name = document.createElement('div');
+      name.className = 'name';
+      name.textContent = template.name;
+
+      const blurb = document.createElement('div');
+      blurb.className = 'blurb';
+      blurb.textContent = template.blurb;
+
+      card.append(name, blurb);
+
+      if (template.pro) {
+        const lock = document.createElement('span');
+        lock.className = 'lock';
+        lock.setAttribute('aria-hidden', 'true');
+        lock.textContent = locked ? '🔒' : '✓';
+        card.appendChild(lock);
+      }
+
+      card.addEventListener('click', () => {
+        if (locked) {
+          openModal();
+          return;
+        }
+        selectedTemplate = template.id;
+        writeStorage(STORAGE.template, selectedTemplate);
+        renderTemplates();
+      });
+
+      templatesEl.appendChild(card);
+    });
+
+    proBadge.hidden = !proUnlocked;
+  }
+
+  function openModal() {
+    if (paymentsEnabled) {
+      modalMessage.textContent = 'Letterhead, Journal, Legal Brief, and Screenplay layouts — one payment, yours forever.';
+      goCheckoutBtn.hidden = false;
+    } else {
+      modalMessage.textContent = 'Pro checkout is not connected on this deployment. The free Plain and Ruled Notepad templates are fully available.';
+      goCheckoutBtn.hidden = true;
+    }
+    modalBackdrop.classList.add('show');
+    closeModalBtn.focus();
+  }
+
+  function closeModal() {
+    modalBackdrop.classList.remove('show');
+  }
+
+  async function loadPaymentConfig() {
+    try {
+      const response = await fetch('./api/config', {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        cache: 'no-store'
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      paymentsEnabled = data.paymentsEnabled === true;
+    } catch (_) {
+      paymentsEnabled = false;
+    }
+  }
+
+  async function startCheckout() {
+    if (!paymentsEnabled) {
+      openModal();
+      return;
+    }
+
+    goCheckoutBtn.disabled = true;
+    goCheckoutBtn.textContent = 'Opening Stripe…';
+
+    try {
+      const response = await fetch('./api/create-checkout-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ product: 'webapp-templates' })
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.url) {
+        throw new Error(data.error || 'The checkout session could not be created.');
+      }
+
+      window.location.assign(data.url);
+    } catch (error) {
+      setStatus(error.message || 'Could not open checkout.', 'error');
+      closeModal();
+      goCheckoutBtn.disabled = false;
+      goCheckoutBtn.textContent = 'Continue to Stripe →';
+    }
+  }
+
+  async function verifyCheckoutReturn() {
+    const url = new URL(window.location.href);
+    const sessionId = url.searchParams.get('session_id');
+    const checkoutState = url.searchParams.get('checkout');
+
+    if (checkoutState === 'cancelled') {
+      setStatus('Checkout cancelled. Your draft is still here.');
+      url.searchParams.delete('checkout');
+      window.history.replaceState({}, document.title, url.pathname + url.search + url.hash);
+    }
+
+    if (!sessionId) return;
+
+    setStatus('Confirming payment…');
+
+    try {
+      const response = await fetch(`./api/verify-session?session_id=${encodeURIComponent(sessionId)}`, {
+        headers: { Accept: 'application/json' },
+        cache: 'no-store'
+      });
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok || data.paid !== true || data.product !== 'webapp-templates') {
+        throw new Error(data.error || 'Payment could not be verified.');
+      }
+
+      proUnlocked = true;
+      writeStorage(STORAGE.pro, 'true');
+      renderTemplates();
+      setStatus('Pro templates unlocked. Pick one above.', 'ok');
+    } catch (error) {
+      setStatus(error.message || 'Payment verification failed.', 'error');
+    } finally {
+      url.searchParams.delete('session_id');
+      window.history.replaceState({}, document.title, url.pathname + url.search + url.hash);
+    }
+  }
+
+  function canShareFile(file) {
+    if (typeof navigator.share !== 'function') return false;
+    if (typeof navigator.canShare !== 'function') return true;
+    try {
+      return navigator.canShare({ files: [file] });
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function downloadBlob(blob, filename) {
+    const blobUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = filename;
+    link.rel = 'noopener';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+  }
+
+  function previewBlobOnApple(blob) {
+    const blobUrl = URL.createObjectURL(blob);
+    // Same-tab navigation is the most dependable Safari fallback and is not
+    // treated as a popup. The user can tap Share -> Save to Files, then Back.
+    window.location.assign(blobUrl);
+  }
+
+  async function exportPdf(doc, filename) {
+    const blob = doc.output('blob');
+    let file = null;
+    try {
+      file = new File([blob], filename, { type: 'application/pdf', lastModified: Date.now() });
+    } catch (_) {
+      // Older Safari versions may not expose the File constructor.
+    }
+
+    if (isAppleMobile && file && canShareFile(file)) {
+      try {
+        await navigator.share({
+          title: filename.replace(/\.pdf$/i, ''),
+          files: [file]
+        });
+        return 'shared';
+      } catch (error) {
+        if (error && error.name === 'AbortError') throw error;
+        // Some Safari versions expose navigator.share but reject PDF files.
+        // Continue to the PDF preview fallback instead of failing silently.
+      }
+    }
+
+    if (isAppleMobile) {
+      previewBlobOnApple(blob);
+      return 'previewed';
+    }
+
+    downloadBlob(blob, filename);
+    return 'downloaded';
+  }
+
+  async function createPdf() {
+    const text = textEl.value;
+    if (!text.trim()) {
+      setStatus('Write something first.', 'error');
+      textEl.focus();
+      return;
+    }
+
+    const template = window.PDFTemplates.list.find((item) => item.id === selectedTemplate);
+    if (!template) {
+      selectedTemplate = 'plain';
+      renderTemplates();
+      setStatus('Template reset to Plain. Please try again.', 'error');
+      return;
+    }
+
+    if (template.pro && !proUnlocked) {
+      openModal();
+      return;
+    }
+
+    const filenameBase = sanitizeFilename(filenameEl.value);
+    filenameEl.value = filenameBase;
+    queueDraftSave();
+
+    convertBtn.disabled = true;
+    convertBtn.textContent = 'Creating PDF…';
+    setStatus('Creating your PDF…');
+
+    try {
+      const doc = window.PDFTemplates.render({
+        text,
+        templateId: selectedTemplate,
+        filename: filenameBase,
+        pageFormat: pageSizeEl.value,
+        fontSize: Number.parseInt(fontSizeEl.value, 10),
+        author: ''
+      });
+
+      if (!doc || typeof doc.output !== 'function') {
+        throw new Error('The PDF renderer did not return a valid document.');
+      }
+
+      const result = await exportPdf(doc, `${filenameBase}.pdf`);
+
+      if (result === 'shared') {
+        setStatus('PDF created. Choose Save to Files, AirDrop, Mail, or another app.', 'ok');
+      } else if (result === 'previewed') {
+        setStatus('PDF opened in Safari. Tap Share, then Save to Files.', 'ok');
+      } else {
+        setStatus(`Saved ${filenameBase}.pdf using the ${template.name} template.`, 'ok');
+      }
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        setStatus('Share cancelled. Your draft is unchanged.');
+      } else {
+        console.error(error);
+        setStatus(error.message || 'Could not create the PDF.', 'error');
+      }
+    } finally {
+      convertBtn.disabled = false;
+      convertBtn.textContent = 'Save / Share PDF';
+    }
+  }
+
+  function setupInstallExperience() {
+    if (isAppleMobile && !isStandalone) {
+      iosHint.style.display = 'block';
+    }
+
+    window.addEventListener('beforeinstallprompt', (event) => {
+      event.preventDefault();
+      deferredInstallPrompt = event;
+      installBtn.style.display = 'inline-block';
+    });
+
+    installBtn.addEventListener('click', async () => {
+      if (!deferredInstallPrompt) return;
+      deferredInstallPrompt.prompt();
+      await deferredInstallPrompt.userChoice;
+      deferredInstallPrompt = null;
+      installBtn.style.display = 'none';
+    });
+
+    window.addEventListener('appinstalled', () => {
+      installBtn.style.display = 'none';
+      setStatus('App installed.', 'ok');
+    });
+  }
+
+  function bindEvents() {
+    textEl.addEventListener('input', queueDraftSave);
+    filenameEl.addEventListener('input', queueDraftSave);
+    pageSizeEl.addEventListener('change', queueDraftSave);
+    fontSizeEl.addEventListener('change', queueDraftSave);
+    convertBtn.addEventListener('click', createPdf);
+    goCheckoutBtn.addEventListener('click', startCheckout);
+    closeModalBtn.addEventListener('click', closeModal);
+
+    modalBackdrop.addEventListener('click', (event) => {
+      if (event.target === modalBackdrop) closeModal();
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && modalBackdrop.classList.contains('show')) closeModal();
+    });
+  }
+
+  window.addEventListener('error', (event) => {
+    const message = event && event.message ? event.message : 'Unknown script error';
+    setStatus(`App error: ${message}. Reload this page after redeploying.`, 'error');
+  });
+
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event && event.reason;
+    const message = reason && reason.message ? reason.message : String(reason || 'Unknown promise error');
+    setStatus(`App error: ${message}`, 'error');
+  });
+
+  function init() {
+    if (!window.PDFTemplates || !Array.isArray(window.PDFTemplates.list)) {
+      setStatus('The template file did not load. Please reload the page.', 'error');
+      return;
+    }
+
+    restoreDraft();
+    renderTemplates();
+    bindEvents();
+    setupInstallExperience();
+    loadPaymentConfig();
+    verifyCheckoutReturn();
+    if (!statusEl.textContent) {
+      setStatus('Ready — type your text and tap Save / Share PDF.', 'ok');
+    }
+  }
+
+  init();
+})();
+
+  </script>
 </body>
 </html>
