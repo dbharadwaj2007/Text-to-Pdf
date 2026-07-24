@@ -1,0 +1,24 @@
+NOTEPAD → PDF PRO — QUICK DEPLOY CHECKLIST
+
+GITHUB PAGES
+[ ] Create repository
+[ ] Upload all files from this folder to repository root
+[ ] Settings → Pages
+[ ] Deploy from branch → main → /(root)
+[ ] Open the generated github.io address on iPhone Safari
+
+VERCEL
+[ ] Import the same GitHub repository into Vercel
+[ ] Framework preset: Other
+[ ] Deploy
+[ ] Optional Stripe variables:
+    STRIPE_SECRET_KEY
+    STRIPE_PRICE_ID
+[ ] Redeploy after adding Stripe variables
+
+IPHONE TEST
+[ ] Open the HTTPS site in Safari
+[ ] Type a test note
+[ ] Tap Save / Share PDF
+[ ] Choose Save to Files
+[ ] Safari Share → Add to Home Screen
