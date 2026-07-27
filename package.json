@@ -1,0 +1,7 @@
+{
+  "name": "text-to-pdf",
+  "version": "1.0.0",
+  "dependencies": {
+    "stripe": "^16.2.0"
+  }
+}
